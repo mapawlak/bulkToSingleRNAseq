@@ -1,0 +1,225 @@
+---
+title: "Identifying zebrafish liver cell populations by comparing zebrafish bulk RNA-seq to human scRNA-seq data"
+author: "Michal Pawlak"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 2
+    toc_float: true
+theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height = 7, fig.width = 7, message=FALSE, warning=FALSE, error = FALSE)
+```
+
+## Introduction
+
+By using FACS and transgenic zebrafish lines we have isolated 3 liver cell populations which likely correspond to hepatocytes (hep), hepatic stellate cells (hsc) and endothelial cells (ec). Bulk RNA-seq has been performed to each of these cell polulations. We have also used whole liver RNA-seq data as a control. We would like to match zebrafish liver cell populations with human liver sc-RNAseq to better describe transcriptomic profile of zebrafish cell populations and define their similarity to corresponding human liver cell populations. For scRNA-seq data we refer to [Nature Communications paper by MacParland et al., 2018.](https://www.nature.com/articles/s41467-018-06318-7).
+
+```{r access data}
+library(readxl)
+library(tidyr)
+library(httr)
+
+#getting raw counts from bulk RNAseq zebrafish experiment
+url_1 <-
+  "../"
+suppressMessages(GET(url_1, write_disk("star_counts.RDS", overwrite = TRUE)))
+star_counts <- readRDS("star_counts.RDS")
+
+#getting average counts per million (cpm) for top 20 clusters scRNA-seq (downloaded from Nature Comm paper)
+url_2 <-
+  "../"
+suppressMessages(GET(url_2, write_disk("scRNAseq.xlsx", overwrite = TRUE)))
+path <- "scRNAseq.xlsx"
+
+#Reading xlsx file as a list
+tmp1 <-
+  lapply(excel_sheets(path),
+  read_excel,
+  skip = 1,
+  path = path)
+```
+
+## Searching for human-zebrafish orthologs
+
+To be able to compare zebrafish and human datasets we are going to identify one to one orthologs of human genes and the genes expressed in liver zerbafish cell populations. For that we are going to use `biomaRt`.
+
+```{r orthologs}
+library(biomaRt)
+library(dplyr)
+
+tmp2 <- list()
+#filtering data to get hgnc symbol and cpm data only
+for (i in 1:length(tmp1)) {
+  tmp2[[i]] <- tmp1[[i]][, c(1, 7)]
+  names(tmp2)[i] <- paste0("cluster", i, sep = " ")
+  colnames(tmp2[[i]]) <- c("hgnc_symbol", "mean_cpm")
+}
+
+#biomart: getting one2one zebrafish orthologs
+zebra <- useMart("ensembl", dataset = "drerio_gene_ensembl")
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+#creating a list of orthologs matching to list from scRNAseq data
+tmp3 <- list()
+for (i in 1:length(tmp2)) {
+  tmp3[[i]] <- getLDS(
+    filters = "hgnc_symbol",
+    attributes = c("hgnc_symbol"),
+    attributesL = c("ensembl_gene_id", "hsapiens_homolog_orthology_type"),
+    values = tmp2[[1]]$hgnc_symbol,
+    mart = human,
+    martL = zebra,
+    bmHeader = TRUE,
+    uniqueRows = TRUE
+    ) %>% dplyr::filter(Human.homology.type == "ortholog_one2one")
+    names(tmp3)[i] <- names(tmp2)[i]
+    tmp3[[i]]$Cluster <- paste("cluster", i, sep = " ")
+    colnames(tmp3[[i]]) <-
+    c("hgnc_symbol", "ensembl_gene_id", "ortholog", "cluster")
+}
+
+#filtering original scRNAseq data to 1) keep only one2one orthologs; 2) ensembl_gene_id present in zebrafish liver data
+keep <- rowSums(star_counts) >= 10
+zebra_counts <-
+  star_counts[keep, ] #filtering zebrafish data to get only expressed genes
+
+tmp4 <- list()
+for (i in 1:length(tmp1)) {
+  tmp4[[i]] <-
+    dplyr::inner_join(tmp2[[i]], tmp3[[i]], by = "hgnc_symbol")
+  tmp4[[i]] <-
+    tmp4[[i]][tmp4[[i]]$ensembl_gene_id %in% rownames(zebra_counts),]
+}
+
+knitr::kable(head(tmp1[[1]], 10), caption = "Representative view of cluster 1 liver scRNA-seq")
+knitr::kable(head(tmp4[[1]], 10), caption = "Representative view of cluster's 1 one2one human-zebrafish orthologs")
+```
+
+## Identifying most expressed genes in every scRNA-seq cluster and correlating them with zebrafish orthologs
+
+We take `n` top expressed genes from every scRNA-seq cluster and combine with corresponding expression from zebrafish RNA-seq. Raw counts are normalized to counts per million (CPM) and then scaled as z-score. Finally Spearman correlation was performed between scRNA-seq clusters and zebrafish bulk RNA-seq.
+
+```{r top expression}
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+
+#select n top genes from every cluster
+gene_number <- 20 #play with the number
+tmp5 <- list()
+for (i in 1:length(tmp4)) {
+  tmp5[[i]] <-
+    tmp4[[i]][order(tmp4[[i]]$mean_cpm, na.last = NA, decreasing = TRUE)[1:gene_number],-4]
+}
+
+#list of marker genes for each cluster - unique in the cluster 
+marker_genes <- unique(unlist(lapply(tmp5, `[`, "hgnc_symbol")))
+
+#filter on marker genes
+tmp6 <- list()
+for (i in 1:length(tmp4)) {
+  tmp6[[i]] <- tmp4[[i]][tmp4[[i]]$hgnc_symbol %in% marker_genes,-4]
+}
+
+#collapse list to data.frame
+tmp7 <- dplyr::bind_rows(tmp6)
+
+#change to wide format
+clusters_cpm <- spread(tmp7, cluster, mean_cpm)
+
+#normalize to cpm
+zebra_cpm_tmp1 <-
+  as.data.frame(apply(zebra_counts, 2, function(x)
+  (x / sum(x)) * 1000000))
+zebra_cpm_tmp2 <-
+  tibble::rownames_to_column(zebra_cpm_tmp1, var = "ensembl_gene_id")
+
+#merge human and zebrafish cpm
+zebra_cpm_tmp3 <-
+  inner_join(zebra_cpm_tmp2, clusters_cpm, by = "ensembl_gene_id")
+rownames(zebra_cpm_tmp3) <- zebra_cpm_tmp3$ensembl_gene_id
+zebra_cpm <- select(zebra_cpm_tmp3,-ensembl_gene_id,-hgnc_symbol)
+zebra_cpm <- apply(zebra_cpm, 2, as.numeric)
+zebra_cpm[is.na(zebra_cpm)] <- 0
+
+#z-scor scaling
+zebra_cpm_zscore <- scale(zebra_cpm, center = TRUE, scale = TRUE)
+
+#spearman correlation human vs. zebrafish
+cor_zebra <- cor(zebra_cpm_zscore, method = "spearman")
+cor_zebra <- cor_zebra[-c(1:8), c(1:8)]
+
+#math sRNA-seq clusters with cell types (based on data from scRNAseq paper)
+cluster_cell <-
+  data.frame(
+  "cell_type" = c(
+  "Hep",
+  "Kupffer",
+  "EC",
+  "EC",
+  "EC",
+  "Hep",
+  "Hep",
+  "B-cell",
+  "Cholangiocyte",
+  "T-cell",
+  "Erythroid",
+  "T-cell",
+  "HSC",
+  "Hep",
+  "Kupffer",
+  "Hep",
+  "Hep",
+  "B-cell",
+  "T-cell",
+  "T-cell"
+  )
+  )
+rownames(cluster_cell) <- rownames(cor_zebra)
+
+#visualize correlation heatmap
+pheatmap(cor_zebra, main = "Top expressed genes in every human scRNA-seq cluster", clustering_distance_rows = "euclidean", annotation_row = cluster_cell)
+```
+
+
+## Identifying most expressed genes in every scRNA-seq cluster and correlating them with zebrafish orthologs
+
+Here we use top `n` variable genes that vary between scRNA-seq clusters and correlate them with corresponding genes in zebrafish.
+
+```{r top variance}
+
+#cleaning data
+temp_var1 <- dplyr::bind_rows(tmp4) %>% dplyr::select(-ortholog)
+temp_var2 <- spread(temp_var1, cluster, mean_cpm)
+temp_var2 <- as.data.frame(temp_var2)
+rownames(temp_var2) <- temp_var2$ensembl_gene_id
+
+#get the variance between samples
+var_genes <- apply(temp_var2[,-c(1,2)], 1, var, na.rm = TRUE)
+
+#take "n" of most variable genes
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:gene_number] #play with number
+temp_var3 <- temp_var2[select_var,]
+temp_var4 <-
+  inner_join(zebra_cpm_tmp2, temp_var3, by = "ensembl_gene_id")
+rownames(temp_var4) <- temp_var4$ensembl_gene_id
+temp_var5 <- select(temp_var4,-ensembl_gene_id,-hgnc_symbol)
+temp_var6 <- apply(temp_var5, 2, as.numeric)
+temp_var6[is.na(temp_var6)] <- 0
+
+#get z_score for selected genes
+variance_zscore <- scale(temp_var6, center = TRUE, scale = TRUE)
+
+#spearman correlation for most variable genes
+cor_variance_zscore <- cor(variance_zscore, method = "spearman")
+cor_variance_zscore <- cor_variance_zscore[-c(1:8), c(1:8)]
+
+#show on heatmap
+pheatmap(cor_variance_zscore, main = "Highest variance of gene expression in human scRNA-seq clusters", clustering_distance_rows = "euclidean", annotation_row = cluster_cell)
+```
